@@ -1,0 +1,14 @@
+[Unit]
+Description="Anonsurf Daemon Service"
+Before=poweroff.target reboot.target tor.service
+After=network.target
+Wants=tor.service
+
+[Service]
+ExecStart=/usr/lib/anonsurf/anondaemon start
+ExecReload=/usr/lib/anonsurf/anondaemon restart
+ExecStop=/usr/lib/anonsurf/anondaemon stop
+RemainAfterExit=yes
+
+[Install]
+WantedBy=default.target

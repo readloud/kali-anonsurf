@@ -1,0 +1,235 @@
+#!/bin/bash
+
+### BEGIN INIT INFO
+# PUT THIS SCRIPT INSIDE /etc/anonsurf/ AS DAEMON SCRIPT
+# Provides:          anonsurf
+# Required-Start:
+# Required-Stop:
+# Should-Start:
+# Default-Start:
+# Default-Stop:
+# Short-Description: Transparent Proxy through TOR.
+### END INIT INFO
+#
+# Devs:
+# Lorenzo 'Palinuro' Faletra <palinuro@parrotsec.org>
+# Lisetta 'Sheireen' Ferrero <sheireen@autistiche.org>
+# Francesco 'Mibofra' Bonanno <mibofra@parrotsec.org>
+#
+# Maintainer:
+# Nong Hoang 'DmKnght' Tu <dmknght@parrotsec.org>
+#
+# Extended:
+# Daniel 'Sawyer' Garcia <dagaba13@gmail.com>
+#
+# anonsurf is free software: you can redistribute it and/or
+# modify it under the terms of the GNU General Public License as
+# published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version.
+# You can get a copy of the license at www.gnu.org/licenses
+#
+# anonsurf is distributed in the hope that it will be
+# useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+# General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with Parrot Security OS. If not, see <http://www.gnu.org/licenses/>.
+
+export BLUE='\033[1;94m'
+export GREEN='\033[1;92m'
+export RED='\033[1;91m'
+export RESETCOLOR='\033[1;00m'
+
+
+# Destinations you don't want routed through Tor
+TOR_EXCLUDE="192.168.0.0/16 172.16.0.0/12 10.0.0.0/8"
+
+# The UID Tor runs as
+# change it if, starting tor, the command 'ps -e | grep tor' returns a different UID
+TOR_UID="debian-tor"
+
+# Tor's TransPort
+# TOR_PORT="9040"
+
+
+function disableService {
+	if [ ! -e /tmp/tor.pid ]; then
+		echo -e -n "\n $GREEN*$BLUE Stopping service nscd${RESETCOLOR}"
+		/usr/sbin/service nscd stop 2>/dev/null || echo " (already stopped)"
+		echo -e -n "\n $GREEN*$BLUE Stopping service resolvconf"
+		/usr/sbin/service resolvconf stop 2>/dev/null || echo " (already stopped)"
+		echo -e -n "\n $GREEN*$BLUE Stopping service dnsmasq$RESETCOLOR${RESETCOLOR}"
+		/usr/sbin/service dnsmasq stop 2>/dev/null || echo " (already stopped)"
+		killall dnsmasq nscd resolvconf 2>/dev/null || true
+		# sleep 1
+		killall -9 dnsmasq 2>/dev/null || true
+	fi
+}
+
+
+function enableService {
+	echo -e -n " $GREEN*$BLUE Restarting services\n"
+	/usr/sbin/service resolvconf start || service resolvconf restart || true
+	/usr/sbin/service dnsmasq start || true
+	/usr/sbin/service nscd start || true
+	echo -e " $GREEN*$BLUE It is safe to not worry for dnsmasq and nscd start errors if they are not installed.$RESETCOLOR"
+	# sleep 1
+}
+
+
+function startSurf {
+	# If tor didn't start, we start it
+	# It is used for startup
+	TOR_PORT=`cat /etc/tor/torrc | grep TransPort | cut -d " " -f 2 | cut -d ":" -f 2`
+	DNS_PORT=`cat /etc/tor/torrc | grep DNSPort | cut -d " " -f 2 | cut -d ":" -f 2`
+	# Init DNS
+	echo -e "[$GREEN*${RESETCOLOR}]$BLUE Modified resolv.conf to use Tor${RESETCOLOR}"
+	/usr/bin/dnstool address 127.0.0.1
+
+	# disable ipv6
+	echo -e "[$GREEN*${RESETCOLOR}]$BLUE Disabling IPv6 for security reasons${RESETCOLOR}"
+	/sbin/sysctl -w net.ipv6.conf.all.disable_ipv6=1
+	/sbin/sysctl -w net.ipv6.conf.default.disable_ipv6=1
+
+	if ! [ -f /etc/network/iptables.rules ]; then
+		/usr/sbin/iptables-save > /etc/network/iptables.rules
+		echo -e "[$GREEN*${RESETCOLOR}]$BLUE Saved iptables rules${RESETCOLOR}"
+	fi
+
+	# Making IPTables rules
+	/usr/sbin/iptables -F
+	/usr/sbin/iptables -t nat -F
+
+	# set iptables nat
+	echo -e "[$GREEN*${RESETCOLOR}]$BLUE Configuring iptables rules to route all traffic through tor${RESETCOLOR}"
+	/usr/sbin/iptables -t nat -A OUTPUT -m owner --uid-owner $TOR_UID -j RETURN
+
+	#set dns redirect
+	echo -e " $GREEN+$BLUE Redirecting DNS traffic through tor${RESETCOLOR}"
+	/usr/sbin/iptables -t nat -A OUTPUT -d 127.0.0.1/32 -p udp -m udp --dport 53 -j REDIRECT --to-ports $DNS_PORT
+
+	#resolve .onion domains mapping 10.192.0.0/10 address space
+	/usr/sbin/iptables -t nat -A OUTPUT -p tcp -d 10.192.0.0/10 -j REDIRECT --to-ports $TOR_PORT
+	/usr/sbin/iptables -t nat -A OUTPUT -p udp -d 10.192.0.0/10 -j REDIRECT --to-ports $TOR_PORT
+
+	#exclude local addresses
+	for NET in $TOR_EXCLUDE 127.0.0.0/9 127.128.0.0/10; do
+		/usr/sbin/iptables -t nat -A OUTPUT -d $NET -j RETURN
+		/usr/sbin/iptables -A OUTPUT -d "$NET" -j ACCEPT
+	done
+
+	#redirect all other output through TOR
+	/usr/sbin/iptables -t nat -A OUTPUT -p tcp --syn -j REDIRECT --to-ports $TOR_PORT
+	/usr/sbin/iptables -t nat -A OUTPUT -p udp -j REDIRECT --to-ports $TOR_PORT
+	/usr/sbin/iptables -t nat -A OUTPUT -p icmp -j REDIRECT --to-ports $TOR_PORT
+
+	#accept already established connections
+	/usr/sbin/iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+	#allow only tor output
+	echo -e " $GREEN+$BLUE Allowing only tor to browse in clearnet$RESETCOLOR"
+	/usr/sbin/iptables -A OUTPUT -m owner --uid-owner $TOR_UID -j ACCEPT
+	/usr/sbin/iptables -A OUTPUT -j REJECT
+
+	# TESTING block all incoming traffics
+	# https://trac.torproject.org/projects/tor/wiki/doc/TransparentProxy
+	/usr/sbin/iptables -A INPUT -m state --state ESTABLISHED -j ACCEPT
+	/usr/sbin/iptables -A INPUT -i lo -j ACCEPT
+
+	/usr/sbin/iptables -A INPUT -j DROP
+
+	### *filter FORWARD
+	/usr/sbin/iptables -A FORWARD -j DROP
+
+	### *filter OUTPUT
+	/usr/sbin/iptables -A OUTPUT -m state --state INVALID -j DROP
+	/usr/sbin/iptables -A OUTPUT -m state --state ESTABLISHED -j ACCEPT
+
+	# Allow Tor process output
+	iptables -A OUTPUT -m owner --uid-owner $TOR_UID -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -m state --state NEW -j ACCEPT
+
+	# Allow loopback output
+	/usr/sbin/iptables -A OUTPUT -d 127.0.0.1/32 -o lo -j ACCEPT
+	# iptables 1.8.5 can't use -o with input
+	# /usr/sbin/iptables -A INPUT -d 127.0.0.1/32 -o lo -j ACCEPT
+
+	# Tor transproxy magic
+	/usr/sbin/iptables -A OUTPUT -d 127.0.0.1/32 -p tcp -m tcp --dport $TOR_PORT --tcp-flags FIN,SYN,RST,ACK SYN -j ACCEPT
+
+	# Allow OUTPUT to lan hosts in $_non_tor
+	# Uncomment these 3 lines to enable.
+	#for _lan in $_non_tor; do
+	# iptables -A OUTPUT -d $_lan -j ACCEPT
+	#done
+
+	# Log & Drop everything else. Uncomment to enable logging
+	#iptables -A OUTPUT -j LOG --log-prefix "Dropped OUTPUT packet: " --log-level 7 --log-uid
+	# /usr/sbin/iptables -A OUTPUT -j DROP
+
+	### Set default policies to DROP
+	# /usr/sbin/iptables -P INPUT DROP
+	# /usr/sbin/iptables -P FORWARD DROP
+	# /usr/sbin/iptables -P OUTPUT DROP
+
+	### Set default policies to DROP for IPv6
+	#ip6tables -P INPUT DROP
+	#ip6tables -P FORWARD DROP
+	#ip6tables -P OUTPUT DROP
+
+}
+
+
+function stopSurf {
+	# re-enable ipv6
+	/sbin/sysctl -w net.ipv6.conf.all.disable_ipv6=0
+	/sbin/sysctl -w net.ipv6.conf.default.disable_ipv6=0
+
+	/usr/sbin/iptables -F
+	/usr/sbin/iptables -t nat -F
+	echo -e "$GREEN*$BLUE Deleted all iptables rules"
+
+	if [ -f /etc/network/iptables.rules ]; then
+		/usr/sbin/iptables-restore < /etc/network/iptables.rules
+		rm /etc/network/iptables.rules
+		echo -e "$GREEN*$BLUE Iptables rules restored"
+	fi
+	echo -e -n "$GREEN*$BLUE Restore DNS service\n$RESETCOLOR"
+	# Restore DNS settings
+	/usr/bin/dnstool address dhcp
+
+	if [ `systemctl is-active tor` == "active" ]
+	then
+		/usr/sbin/service tor stop
+	fi
+	# sleep 1
+	killall tor
+}
+
+
+case "$1" in
+	start)
+		# disableService
+		/usr/lib/anonsurf/make-torrc
+		if [ -e /etc/tor/torrc ]; then
+			startSurf
+			if [ `systemctl is-active tor` != "active" ]
+			then
+				/usr/sbin/service tor start || echo -e "  [x] Can not start Tor service!"
+			fi
+		else
+			echo -e "  [x] torrc not found. Can not start!"
+		fi
+	;;
+	stop)
+		stopSurf
+		# enableService
+		/usr/lib/anonsurf/make-torrc restore
+	;;
+	restart)
+		$0 stopSurf
+		# sleep 1
+		$0 startSurf
+	;;
+	*)
+	esac
